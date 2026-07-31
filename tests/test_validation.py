@@ -55,6 +55,7 @@ class TestLooksLikePaywallOrLandingPage:
         'Access through your institution',
         'Purchase access',
         'Checking your browser',
+        'Please enable JavaScript and cookies to continue',
         'Are you a robot',
     ])
     def test_paywall_and_bot_check_markers_are_rejected(self, marker):
@@ -66,6 +67,12 @@ class TestLooksLikePaywallOrLandingPage:
     def test_abstract_without_body_sections_is_rejected(self):
         abstract = 'Abstract. ' + ('We report a finding of interest. ' * 400)
         assert looks_like_paywall_or_landing_page(abstract) is True
+
+    def test_noscript_javascript_banner_does_not_reject_a_body(self):
+        # React-based publisher sites put this banner in a <noscript> tag at
+        # the top of genuine full-text pages. It must not read as a bot check.
+        text = 'You need to enable JavaScript to run this app. ' + make_body()
+        assert looks_like_paywall_or_landing_page(text) is False
 
 
 class TestIsFullText:
