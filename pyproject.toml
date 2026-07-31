@@ -8,7 +8,9 @@ version = "0.1.0"
 description = "Retrieve the full text of a scholarly article from its DOI, and know when you did not get it"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Ben Dichter" }]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "CatalystNeuro" }]
 keywords = ["doi", "fulltext", "open-access", "crossref", "unpaywall", "pubmed-central"]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -21,6 +23,10 @@ dependencies = [
     "beautifulsoup4>=4.11.0",
     "lxml>=4.9.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/catalystneuro/paper-text-fetcher"
+Issues = "https://github.com/catalystneuro/paper-text-fetcher/issues"
 
 [project.optional-dependencies]
 # Without these the fetcher still runs; coverage drops for preprints,
