@@ -19,10 +19,11 @@ result reports which one it is:
 from .fetcher import (
     DEFAULT_USER_AGENT,
     PLAYWRIGHT_AVAILABLE,
+    PYMUPDF_AVAILABLE,
     PaperFetcher,
     format_crossref_reference,
 )
-from .cache import TextCache, cache_filename
+from .cache import TextCache, cache_filename, legacy_cache_filename
 from .validation import (
     FULL_TEXT_SOURCES,
     METADATA_SOURCES,
@@ -39,6 +40,7 @@ __all__ = [
     'PaperFetcher',
     'TextCache',
     'cache_filename',
+    'legacy_cache_filename',
     'format_crossref_reference',
     'is_full_text',
     'has_full_text_source',
@@ -49,5 +51,6 @@ __all__ = [
     'MIN_FULL_TEXT_CHARS',
     'DEFAULT_USER_AGENT',
     'PLAYWRIGHT_AVAILABLE',
+    'PYMUPDF_AVAILABLE',
     '__version__',
 ]

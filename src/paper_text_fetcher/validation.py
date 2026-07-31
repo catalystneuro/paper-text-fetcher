@@ -48,7 +48,10 @@ PAYWALL_MARKERS = (
     'sign in to read',
     'this content is only available',
     'checking your browser',
-    'enable javascript',
+    # Cloudflare's bot-check phrasing. The broader 'enable javascript' also
+    # matches the <noscript> banner that React-based publisher sites put at the
+    # top of genuine full-text pages, so it must not be matched on its own.
+    'enable javascript and cookies',
     'are you a robot',
     'unusual traffic',
 )
@@ -87,10 +90,11 @@ def looks_like_paywall_or_landing_page(text: str | None) -> bool:
     """
     if not text:
         return True
-    head = text[:4000].lower()
+    lowered = text.lower()
+    head = lowered[:4000]
     if any(marker in head for marker in PAYWALL_MARKERS):
         return True
-    return not any(marker in text.lower() for marker in BODY_MARKERS)
+    return not any(marker in lowered for marker in BODY_MARKERS)
 
 
 def is_full_text(text: str | None, source: str | None) -> bool:

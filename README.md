@@ -67,6 +67,16 @@ discarded, but it should not be fed to anything that expects a paper.
 tuple for callers that predate the status field. It cannot express the
 distinction above, so new code should prefer the detailed form.
 
+The fetcher holds a `requests` session and, when the browser extra is
+installed, a headless Chromium instance that is launched once and reused across
+fetches. Use it as a context manager, or call `close()`, so both are released:
+
+```python
+with PaperFetcher(cache_dir='.paper_cache', contact_email='you@example.org') as fetcher:
+    for doi in dois:
+        result = fetcher.get_paper_text_detailed(doi)
+```
+
 ## Sources
 
 Sources are tried in a fallback chain, and results from several of them are
@@ -116,13 +126,30 @@ positives.
 ## Caching
 
 Text is cached as one JSON file per DOI in `cache_dir`. Each entry records
-whether it holds an article body.
+whether it holds an article body. Filenames are the percent-encoded, lowercased
+DOI, which is reversible and so cannot map two different DOIs onto one file.
+Entries written under the older scheme are still found and read.
 
-Entries written before that flag existed are re-judged from their content on
-read rather than trusted by their source name. This matters when adopting the
-library against an existing cache: the older code stored landing pages under the
-`publisher_html` source, so believing the source name would carry the original
-error forward. Re-judging on read corrects it without a refetch.
+Entries written before the full-text flag existed are re-judged from their
+content on read rather than trusted by their source name. This matters when
+adopting the library against an existing cache: the older code stored landing
+pages under the `publisher_html` source, so believing the source name would
+carry the original error forward. Re-judging on read corrects it without a
+refetch.
+
+Metadata-only results are cached as well, but they expire after
+`metadata_cache_ttl_days` (7 by default, `None` to disable). Full-text entries
+never expire. The asymmetry is deliberate: a body does not stop being a body,
+but a paper that was closed access last month may be open today, and without
+expiry it would never be retried. Caching these results at all matters for
+throughput, since a closed-access DOI otherwise re-walks the entire fallback
+chain, browser included, on every lookup.
+
+## Request Pacing
+
+Requests to the metadata APIs are spaced by a per-host minimum interval, so the
+delay is paid only when two requests to the same service would land too close
+together. A fetch that succeeds on its first source waits for nothing.
 
 ## Identifying Yourself
 

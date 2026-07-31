@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,11 +34,42 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
+# Try to import PyMuPDF for PDF text extraction
+try:
+    import fitz
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+
 
 DEFAULT_USER_AGENT = (
     'paper-text-fetcher/0.1 '
     '(https://github.com/bendichter/paper-text-fetcher)'
 )
+
+BROWSER_USER_AGENT = (
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+)
+
+# Minimum seconds between successive requests to the same host. NCBI asks for
+# at most 3 requests per second without an API key; the others have no hard
+# published limit but are free services worth pacing. Requests to hosts not
+# listed here (publisher sites, PDF hosts) are not throttled, since we make at
+# most one or two requests to any of them per DOI.
+HOST_MIN_INTERVALS = {
+    'eutils.ncbi.nlm.nih.gov': 0.34,
+    'pmc.ncbi.nlm.nih.gov': 0.34,
+    'www.ebi.ac.uk': 0.2,
+    'api.crossref.org': 0.2,
+    'api.unpaywall.org': 0.2,
+}
+
+# DOI prefixes registered to Elsevier and its imprints, used to decide whether
+# the ScienceDirect article API is worth asking. 10.1016 is Elsevier proper;
+# the others are Saunders, Harcourt, Mosby, and Urban & Fischer, all served by
+# the same endpoint.
+ELSEVIER_DOI_PREFIXES = ('10.1016/', '10.1053/', '10.1054/', '10.1067/', '10.1078/')
 
 
 def format_crossref_reference(index: int, ref: dict) -> str:
@@ -86,6 +117,7 @@ class PaperFetcher:
         api_keys: dict[str, str] | None = None,
         verbose: bool = False,
         use_cache: bool = True,
+        metadata_cache_ttl_days: float | None = 7.0,
     ):
         """
         Args:
@@ -100,12 +132,20 @@ class PaperFetcher:
                 recognises 'elsevier' for the ScienceDirect full-text API.
             verbose: Print per-source progress to stderr.
             use_cache: Whether to read and write the on-disk cache.
+            metadata_cache_ttl_days: How long cached metadata-only results stay
+                valid before the fallback chain is retried, since closed-access
+                papers do become open later. Full-text entries never expire.
+                None disables expiry.
         """
         self.verbose = verbose
         self.contact_email = contact_email
         self.tool_name = tool_name
         self.api_keys = api_keys or {}
-        self.cache = TextCache(Path(cache_dir), enabled=use_cache)
+        self.cache = TextCache(
+            Path(cache_dir),
+            enabled=use_cache,
+            metadata_ttl_days=metadata_cache_ttl_days,
+        )
 
         agent = user_agent or DEFAULT_USER_AGENT
         if contact_email and 'mailto:' not in agent:
@@ -113,6 +153,10 @@ class PaperFetcher:
 
         self.session = requests.Session()
         self.session.headers.update({'User-Agent': agent})
+
+        self._last_request_at: dict[str, float] = {}
+        self._playwright = None
+        self._browser = None
 
     @property
     def use_cache(self) -> bool:
@@ -133,6 +177,85 @@ class PaperFetcher:
         if self.contact_email:
             params['email'] = self.contact_email
         return params
+
+    def _polite_get(self, url: str, **kwargs) -> requests.Response:
+        """
+        session.get with a per-host minimum interval between requests.
+
+        Only waits when a request to the same rate-limited host would come too
+        soon after the previous one, so single fetches pay little or nothing
+        while batch runs stay within each service's request-rate guidance.
+        """
+        host = urlparse(url).netloc
+        min_interval = HOST_MIN_INTERVALS.get(host, 0.0)
+        if min_interval:
+            elapsed = time.monotonic() - self._last_request_at.get(host, 0.0)
+            wait = min_interval - elapsed
+            if wait > 0:
+                time.sleep(wait)
+        try:
+            return self.session.get(url, **kwargs)
+        finally:
+            if min_interval:
+                self._last_request_at[host] = time.monotonic()
+
+    # ------------------------------------------------------------------ #
+    # Playwright browser lifecycle
+    # ------------------------------------------------------------------ #
+
+    def _get_browser(self):
+        """
+        Return a shared headless Chromium instance, launching it on first use.
+
+        Launching Chromium costs about a second, so one instance is reused
+        across all Playwright fetches rather than launched per call. Call
+        `close()` (or use the fetcher as a context manager) to release it.
+        """
+        if not PLAYWRIGHT_AVAILABLE:
+            return None
+        if self._browser is None:
+            try:
+                self._playwright = sync_playwright().start()
+                self._browser = self._playwright.chromium.launch(
+                    headless=True,
+                    args=['--disable-blink-features=AutomationControlled']
+                )
+            except Exception as e:
+                self.log(f"Failed to launch browser: {e}")
+                self._close_browser()
+                return None
+        return self._browser
+
+    def _close_browser(self):
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+
+    def close(self):
+        """Release the shared browser and the HTTP session."""
+        self._close_browser()
+        self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Utility helpers
@@ -157,7 +280,7 @@ class PaperFetcher:
         }
 
         try:
-            resp = self.session.get(converter_url, params=params, timeout=30)
+            resp = self._polite_get(converter_url, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()
 
@@ -172,6 +295,39 @@ class PaperFetcher:
     # ------------------------------------------------------------------ #
     # Source-specific fetchers
     # ------------------------------------------------------------------ #
+
+    def _extract_jats_text(self, content: bytes, record_id: str) -> Optional[str]:
+        """
+        Extract article text and hyperlinks from a JATS full-text XML record.
+
+        Returns None for abstract-only records (no substantive <body>); see
+        validation.xml_has_body. Parsed with html.parser rather than lxml:
+        lxml-xml truncates table content in STAR Methods sections, and lxml's
+        HTML mode wraps the document in its own <body> element, which would
+        defeat the abstract-only check.
+        """
+        soup = BeautifulSoup(content, 'html.parser')
+
+        if not xml_has_body(soup):
+            self.log(
+                f"Record {record_id} has no article body (abstract-only), skipping"
+            )
+            return None
+
+        text = soup.get_text(separator=' ', strip=True)
+
+        # Also extract hyperlink URLs from ext-link elements
+        ext_links = []
+        for link in soup.find_all('ext-link'):
+            href = link.get('xlink:href', '') or link.get('href', '')
+            if href:
+                ext_links.append(href)
+
+        if ext_links:
+            self.log(f"Found {len(ext_links)} hyperlinks in XML")
+            text = text + '\n\n[HYPERLINKS]\n' + '\n'.join(ext_links)
+
+        return text
 
     def get_text_from_europe_pmc(self, doi: str) -> tuple[Optional[str], Optional[str]]:
         """
@@ -188,13 +344,15 @@ class PaperFetcher:
 
         search_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
         params = {
-            'query': f'DOI:"{doi}"',
+            # Backslash-escape any quote in the DOI so it cannot terminate the
+            # quoted query term early
+            'query': f'DOI:"{doi.replace(chr(34), chr(92) + chr(34))}"',
             'format': 'json',
             'resultType': 'core'
         }
 
         try:
-            resp = self.session.get(search_url, params=params, timeout=30)
+            resp = self._polite_get(search_url, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()
 
@@ -209,32 +367,9 @@ class PaperFetcher:
                     fulltext_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
 
                     try:
-                        ft_resp = self.session.get(fulltext_url, timeout=30)
+                        ft_resp = self._polite_get(fulltext_url, timeout=30)
                         if ft_resp.status_code == 200:
-                            # Use html.parser for more complete text extraction
-                            # (lxml-xml truncates table content in STAR Methods)
-                            soup = BeautifulSoup(ft_resp.content, 'html.parser')
-
-                            if not xml_has_body(soup):
-                                self.log(
-                                    f"Europe PMC record for {pmcid} has no article body "
-                                    "(abstract-only), skipping"
-                                )
-                                return None, pmcid_found
-
-                            text = soup.get_text(separator=' ', strip=True)
-
-                            # Also extract hyperlink URLs from ext-link elements
-                            ext_links = []
-                            for link in soup.find_all('ext-link'):
-                                href = link.get('xlink:href', '') or link.get('href', '')
-                                if href:
-                                    ext_links.append(href)
-
-                            if ext_links:
-                                self.log(f"Found {len(ext_links)} hyperlinks in XML")
-                                text = text + '\n\n[HYPERLINKS]\n' + '\n'.join(ext_links)
-
+                            text = self._extract_jats_text(ft_resp.content, pmcid)
                             return text, pmcid_found
                     except Exception as e:
                         self.log(f"Error fetching full text: {e}")
@@ -247,29 +382,11 @@ class PaperFetcher:
                         fulltext_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{ft_id}/fullTextXML"
 
                         try:
-                            ft_resp = self.session.get(fulltext_url, timeout=30)
+                            ft_resp = self._polite_get(fulltext_url, timeout=30)
                             if ft_resp.status_code == 200:
-                                soup = BeautifulSoup(ft_resp.content, 'html.parser')
-
-                                if not xml_has_body(soup):
-                                    self.log(
-                                        f"Europe PMC preprint record {ft_id} has no article "
-                                        "body (abstract-only), skipping"
-                                    )
+                                text = self._extract_jats_text(ft_resp.content, ft_id)
+                                if text is None:
                                     continue
-
-                                text = soup.get_text(separator=' ', strip=True)
-
-                                ext_links = []
-                                for link in soup.find_all('ext-link'):
-                                    href = link.get('xlink:href', '') or link.get('href', '')
-                                    if href:
-                                        ext_links.append(href)
-
-                                if ext_links:
-                                    self.log(f"Found {len(ext_links)} hyperlinks in preprint XML")
-                                    text = text + '\n\n[HYPERLINKS]\n' + '\n'.join(ext_links)
-
                                 return text, pmcid_found
                         except Exception as e:
                             self.log(f"Error fetching preprint full text: {e}")
@@ -290,48 +407,37 @@ class PaperFetcher:
         """
         self.log(f"Trying NCBI PMC for DOI: {doi}")
 
-        converter_url = "https://pmc.ncbi.nlm.nih.gov/tools/idconv/api/v1/articles/"
-        params = {
-            'ids': doi,
-            'format': 'json',
-            **self._ncbi_params(),
-        }
+        pmcid = self.get_pmcid_for_doi(doi)
+        if not pmcid:
+            return None, None
+        self.log(f"Found PMCID: {pmcid}")
 
         try:
-            resp = self.session.get(converter_url, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
+            efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+            params = {
+                'db': 'pmc',
+                'id': pmcid,
+                'rettype': 'xml',
+                **self._ncbi_params(),
+            }
 
-            records = data.get('records', [])
-            if records and records[0].get('pmcid'):
-                pmcid = records[0]['pmcid']
-                self.log(f"Found PMCID: {pmcid}")
+            ft_resp = self._polite_get(efetch_url, params=params, timeout=30)
+            if ft_resp.status_code == 200:
+                soup = BeautifulSoup(ft_resp.content, 'lxml-xml')
 
-                efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-                params = {
-                    'db': 'pmc',
-                    'id': pmcid,
-                    'rettype': 'xml',
-                    **self._ncbi_params(),
-                }
+                if not xml_has_body(soup):
+                    self.log(
+                        f"NCBI PMC record for {pmcid} has no article body "
+                        "(abstract-only), skipping"
+                    )
+                    return None, pmcid
 
-                ft_resp = self.session.get(efetch_url, params=params, timeout=30)
-                if ft_resp.status_code == 200:
-                    soup = BeautifulSoup(ft_resp.content, 'lxml-xml')
-
-                    if not xml_has_body(soup):
-                        self.log(
-                            f"NCBI PMC record for {pmcid} has no article body "
-                            "(abstract-only), skipping"
-                        )
-                        return None, pmcid
-
-                    return soup.get_text(separator=' ', strip=True), pmcid
+                return soup.get_text(separator=' ', strip=True), pmcid
 
         except Exception as e:
             self.log(f"NCBI PMC error: {e}")
 
-        return None, None
+        return None, pmcid
 
     def get_text_from_crossref(self, doi: str) -> Optional[str]:
         """
@@ -344,7 +450,7 @@ class PaperFetcher:
         url = f"https://api.crossref.org/works/{quote(doi, safe='')}"
 
         try:
-            resp = self.session.get(url, timeout=30)
+            resp = self._polite_get(url, timeout=30)
             resp.raise_for_status()
             data = resp.json()
 
@@ -390,50 +496,54 @@ class PaperFetcher:
 
         Requires: pip install playwright && playwright install chromium
         """
-        if not PLAYWRIGHT_AVAILABLE:
+        browser = self._get_browser()
+        if browser is None:
             self.log("Playwright not available, skipping PMC browser fetch")
             return None
 
         self.log(f"Trying PMC via Playwright for PMCID: {pmcid}")
 
+        context = None
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=['--disable-blink-features=AutomationControlled']
-                )
-                context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
-                page = context.new_page()
+            context = browser.new_context(user_agent=BROWSER_USER_AGENT)
+            page = context.new_page()
 
-                url = f'https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/'
-                self.log(f"Navigating to: {url}")
+            url = f'https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/'
+            self.log(f"Navigating to: {url}")
 
-                page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                page.wait_for_timeout(5000)
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+            # Wait for the article content rather than a fixed interval; on
+            # timeout fall through and judge whatever rendered
+            try:
+                page.wait_for_selector('article, main', timeout=10000)
+            except Exception:
+                pass
 
-                title = page.title()
-                if 'not found' in title.lower() or '404' in title or 'error' in title.lower():
-                    self.log(f"Page not found for {pmcid}")
-                    browser.close()
-                    return None
+            title = page.title()
+            if 'not found' in title.lower() or '404' in title or 'error' in title.lower():
+                self.log(f"Page not found for {pmcid}")
+                return None
 
-                text = page.inner_text('body')
+            text = page.inner_text('body')
 
-                if is_full_text(text, 'pmc_playwright'):
-                    self.log(f"Got {len(text)} chars from PMC via Playwright")
-                    browser.close()
-                    return text
+            if is_full_text(text, 'pmc_playwright'):
+                self.log(f"Got {len(text)} chars from PMC via Playwright")
+                return text
 
-                self.log(
-                    f"PMC Playwright page is not full text "
-                    f"({len(text) if text else 0} chars)"
-                )
-                browser.close()
+            self.log(
+                f"PMC Playwright page is not full text "
+                f"({len(text) if text else 0} chars)"
+            )
 
         except Exception as e:
             self.log(f"PMC Playwright error: {e}")
+            self._close_browser()
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
         return None
 
@@ -443,61 +553,67 @@ class PaperFetcher:
 
         Requires: pip install playwright && playwright install chromium
         """
-        if not PLAYWRIGHT_AVAILABLE:
-            self.log("Playwright not available, skipping bioRxiv browser fetch")
+        if not self.is_preprint_doi(doi):
             return None
 
-        if not self.is_preprint_doi(doi):
+        browser = self._get_browser()
+        if browser is None:
+            self.log("Playwright not available, skipping bioRxiv browser fetch")
             return None
 
         self.log(f"Trying bioRxiv/medRxiv via Playwright for DOI: {doi}")
 
+        context = None
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=['--disable-blink-features=AutomationControlled']
-                )
-                context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
-                page = context.new_page()
+            context = browser.new_context(user_agent=BROWSER_USER_AGENT)
+            page = context.new_page()
 
-                for server in ['biorxiv', 'medrxiv']:
-                    url = f'https://www.{server}.org/content/{doi}v1.full'
-                    self.log(f"Navigating to: {url}")
+            for server in ['biorxiv', 'medrxiv']:
+                url = f'https://www.{server}.org/content/{quote(doi, safe="/")}v1.full'
+                self.log(f"Navigating to: {url}")
 
+                try:
+                    page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                    # The article appears once any Cloudflare challenge has
+                    # passed; on timeout fall through and judge what rendered
                     try:
-                        page.goto(url, wait_until='domcontentloaded', timeout=30000)
-                        page.wait_for_timeout(10000)
-
-                        title = page.title()
-                        if 'not found' in title.lower() or '404' in title:
-                            self.log(f"Page not found on {server}")
-                            continue
-
-                        article = page.query_selector('article')
-                        if article:
-                            text = article.inner_text()
-                        else:
-                            text = page.inner_text('body')
-
-                        if is_full_text(text, 'playwright_biorxiv'):
-                            self.log(f"Got {len(text)} chars from {server} via Playwright")
-                            browser.close()
-                            return text
-                        self.log(
-                            f"{server} page is not full text "
-                            f"({len(text) if text else 0} chars)"
+                        page.wait_for_selector(
+                            '.article.fulltext-view, article', timeout=15000
                         )
-                    except Exception as e:
-                        self.log(f"Error fetching from {server}: {e}")
+                    except Exception:
+                        pass
+
+                    title = page.title()
+                    if 'not found' in title.lower() or '404' in title:
+                        self.log(f"Page not found on {server}")
                         continue
 
-                browser.close()
+                    article = page.query_selector('article')
+                    if article:
+                        text = article.inner_text()
+                    else:
+                        text = page.inner_text('body')
+
+                    if is_full_text(text, 'playwright_biorxiv'):
+                        self.log(f"Got {len(text)} chars from {server} via Playwright")
+                        return text
+                    self.log(
+                        f"{server} page is not full text "
+                        f"({len(text) if text else 0} chars)"
+                    )
+                except Exception as e:
+                    self.log(f"Error fetching from {server}: {e}")
+                    continue
 
         except Exception as e:
             self.log(f"Playwright error: {e}")
+            self._close_browser()
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
         return None
 
@@ -509,50 +625,52 @@ class PaperFetcher:
 
         Requires: pip install playwright && playwright install chromium
         """
-        if not PLAYWRIGHT_AVAILABLE:
+        browser = self._get_browser()
+        if browser is None:
             self.log("Playwright not available, skipping publisher browser fetch")
             return None
 
         self.log(f"Trying publisher HTML via Playwright for DOI: {doi}")
 
+        context = None
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=['--disable-blink-features=AutomationControlled']
-                )
-                context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
-                page = context.new_page()
+            context = browser.new_context(user_agent=BROWSER_USER_AGENT)
+            page = context.new_page()
 
-                doi_url = f'https://doi.org/{doi}'
-                self.log(f"Navigating to: {doi_url}")
+            doi_url = f'https://doi.org/{quote(doi, safe="/")}'
+            self.log(f"Navigating to: {doi_url}")
 
-                page.goto(doi_url, wait_until='domcontentloaded', timeout=30000)
-                page.wait_for_timeout(5000)
+            page.goto(doi_url, wait_until='domcontentloaded', timeout=30000)
+            try:
+                page.wait_for_selector('article, main, [role="main"]', timeout=8000)
+            except Exception:
+                pass
 
-                title = page.title()
-                if 'not found' in title.lower() or '404' in title or 'error' in title.lower():
-                    self.log(f"Page not found for {doi}")
-                    browser.close()
-                    return None
+            title = page.title()
+            if 'not found' in title.lower() or '404' in title or 'error' in title.lower():
+                self.log(f"Page not found for {doi}")
+                return None
 
-                text = page.inner_text('body')
+            text = page.inner_text('body')
 
-                if text and len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
-                    self.log(f"Got {len(text)} chars from publisher via Playwright")
-                    browser.close()
-                    return text
+            if text and len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
+                self.log(f"Got {len(text)} chars from publisher via Playwright")
+                return text
 
-                self.log(
-                    f"Publisher Playwright page is not full text "
-                    f"({len(text) if text else 0} chars)"
-                )
-                browser.close()
+            self.log(
+                f"Publisher Playwright page is not full text "
+                f"({len(text) if text else 0} chars)"
+            )
 
         except Exception as e:
             self.log(f"Publisher Playwright error: {e}")
+            self._close_browser()
+        finally:
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
         return None
 
@@ -565,16 +683,16 @@ class PaperFetcher:
         """
         self.log(f"Trying publisher HTML for DOI: {doi}")
 
-        doi_url = f"https://doi.org/{doi}"
+        doi_url = f"https://doi.org/{quote(doi, safe='/')}"
 
         try:
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': BROWSER_USER_AGENT,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'en-US,en;q=0.5',
             }
 
-            resp = self.session.get(doi_url, headers=headers, timeout=30, allow_redirects=True)
+            resp = self._polite_get(doi_url, headers=headers, timeout=30, allow_redirects=True)
             resp.raise_for_status()
 
             content_type = resp.headers.get('content-type', '')
@@ -582,9 +700,12 @@ class PaperFetcher:
                 self.log(f"Not HTML content: {content_type}")
                 return None
 
-            soup = BeautifulSoup(resp.content, 'html.parser')
+            soup = BeautifulSoup(resp.content, 'lxml')
 
-            for element in soup(['script', 'style', 'nav', 'header', 'footer']):
+            # noscript must go too: React-based publisher sites put an "enable
+            # JavaScript" banner there that would land at the top of the
+            # extracted text and read as a bot-check page
+            for element in soup(['script', 'style', 'noscript', 'nav', 'header', 'footer']):
                 element.decompose()
 
             article_content = None
@@ -625,31 +746,26 @@ class PaperFetcher:
             self.log("Trying Playwright fallback for publisher HTML")
             return self.get_text_from_publisher_playwright(doi)
 
-        return None
-
     def extract_text_from_pdf_url(self, url: str) -> Optional[str]:
         """Download a PDF from a URL and extract text using PyMuPDF."""
-        import tempfile
+        if not PYMUPDF_AVAILABLE:
+            self.log("PyMuPDF not available, skipping PDF extraction")
+            return None
         try:
-            resp = self.session.get(url, timeout=60, stream=True)
-            if resp.status_code != 200:
-                self.log(f"PDF download failed: HTTP {resp.status_code}")
-                return None
-            content_type = resp.headers.get('content-type', '')
-            if 'pdf' not in content_type and not url.endswith('.pdf'):
-                self.log(f"Not a PDF: {content_type}")
-                return None
-            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    tmp.write(chunk)
-                tmp_path = tmp.name
-            import fitz  # PyMuPDF
-            pages = []
-            with fitz.open(tmp_path) as doc:
-                for page in doc:
-                    pages.append(page.get_text())
-            Path(tmp_path).unlink(missing_ok=True)
-            text = '\n'.join(pages).strip()
+            # stream=True so the content-type check happens on the headers,
+            # before the body of a non-PDF is pulled down
+            with self._polite_get(url, timeout=60, stream=True) as resp:
+                if resp.status_code != 200:
+                    self.log(f"PDF download failed: HTTP {resp.status_code}")
+                    return None
+                content_type = resp.headers.get('content-type', '')
+                path_is_pdf = urlparse(url).path.lower().endswith('.pdf')
+                if 'pdf' not in content_type and not path_is_pdf:
+                    self.log(f"Not a PDF: {content_type}")
+                    return None
+                pdf_bytes = resp.content
+            with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
+                text = '\n'.join(page.get_text() for page in doc).strip()
             if len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
                 return text
             self.log(
@@ -680,13 +796,13 @@ class PaperFetcher:
             return None
 
         # Only Elsevier-published DOIs are served by this endpoint
-        if not doi.startswith('10.1016/'):
+        if not doi.startswith(ELSEVIER_DOI_PREFIXES):
             return None
 
         self.log(f"Trying Elsevier API for DOI: {doi}")
         try:
-            resp = self.session.get(
-                f"https://api.elsevier.com/content/article/doi/{doi}",
+            resp = self._polite_get(
+                f"https://api.elsevier.com/content/article/doi/{quote(doi, safe='/')}",
                 headers={
                     'X-ELS-APIKey': api_key,
                     'Accept': 'text/plain',
@@ -725,8 +841,8 @@ class PaperFetcher:
 
         self.log(f"Trying Unpaywall for DOI: {doi}")
         try:
-            resp = self.session.get(
-                f"https://api.unpaywall.org/v2/{doi}",
+            resp = self._polite_get(
+                f"https://api.unpaywall.org/v2/{quote(doi, safe='/')}",
                 params={'email': self.contact_email},
                 timeout=15,
             )
@@ -840,7 +956,6 @@ class PaperFetcher:
                 text_parts.append(text)
                 sources_used.append('europe_pmc')
             else:
-                time.sleep(0.5)
                 # Try NCBI PMC
                 text, ncbi_pmcid = self.get_text_from_pmc(doi)
                 if ncbi_pmcid:
@@ -849,7 +964,6 @@ class PaperFetcher:
                     self.log(f"Got text from ncbi_pmc ({len(text)} chars)")
                     text_parts.append(text)
                     sources_used.append('ncbi_pmc')
-                time.sleep(0.5)
 
             # Always try CrossRef for the reference list
             crossref_text = self.get_text_from_crossref(doi)
@@ -858,7 +972,6 @@ class PaperFetcher:
                 text_parts.append(crossref_text)
                 if 'crossref' not in sources_used:
                     sources_used.append('crossref')
-            time.sleep(0.5)
 
             # If PMC text is short, try Playwright for more complete content
             MIN_PMC_TEXT_FOR_COMPLETENESS = 15000
@@ -914,11 +1027,9 @@ class PaperFetcher:
             source_str = '+'.join(sources_used)
             has_full_text = has_full_text_source(source_str)
 
-            # Only cache if we have more than just crossref metadata
-            if sources_used != ['crossref']:
-                self.cache.put(doi, combined_text, source_str, has_full_text)
-            else:
-                self.log(f"Skipping cache for crossref-only result: {doi}")
+            # Metadata-only results are cached too; the cache expires them
+            # after its TTL so the fallback chain is eventually retried
+            self.cache.put(doi, combined_text, source_str, has_full_text)
 
             if not has_full_text:
                 self.log(
