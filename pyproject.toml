@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "paper-text-fetcher"
+version = "0.1.0"
+description = "Retrieve the full text of a scholarly article from its DOI, and know when you did not get it"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Ben Dichter" }]
+keywords = ["doi", "fulltext", "open-access", "crossref", "unpaywall", "pubmed-central"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+dependencies = [
+    "requests>=2.28.0",
+    "beautifulsoup4>=4.11.0",
+    "lxml>=4.9.0",
+]
+
+[project.optional-dependencies]
+# Without these the fetcher still runs; coverage drops for preprints,
+# JavaScript-rendered publisher pages, and PDF-only open-access copies.
+pdf = ["PyMuPDF"]
+browser = ["playwright"]
+all = ["PyMuPDF", "playwright"]
+dev = ["pytest>=7.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/paper_text_fetcher"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
