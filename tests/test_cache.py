@@ -95,6 +95,27 @@ def test_legacy_landing_page_entry_is_a_miss(tmp_path):
     assert cache.get('10.1/legacy') is None
 
 
+def test_writing_retires_the_legacy_entry(tmp_path):
+    """
+    A refetch of a legacy-cached paper must not leave both copies on disk.
+    Reads would still be correct, since the canonical name is checked first,
+    but the stale text stays behind for anything that rebuilds the old
+    filename itself. Observed after re-extracting 2,470 papers: the cache grew
+    by that many files and every one of the old copies still held the text the
+    refetch had replaced.
+    """
+    cache = TextCache(tmp_path)
+    legacy = tmp_path / legacy_cache_filename('10.1/x')
+    legacy.write_text(json.dumps({'doi': '10.1/x', 'text': 'stale',
+                                  'source': 'unpaywall', 'has_full_text': True}))
+
+    cache.put('10.1/x', BODY_TEXT, 'unpaywall', True)
+
+    assert not legacy.exists()
+    assert cache.path_for('10.1/x').exists()
+    assert cache.get('10.1/x')[0] == BODY_TEXT
+
+
 def test_stored_flag_is_trusted_when_present(tmp_path):
     cache = TextCache(tmp_path)
     cache.put('10.1/x', 'short', 'europe_pmc', False)

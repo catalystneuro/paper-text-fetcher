@@ -147,6 +147,13 @@ class TextCache:
             except BaseException:
                 Path(tmp_path).unlink(missing_ok=True)
                 raise
+            # Retire any entry written under the pre-0.2 filename. Without this
+            # a refetch leaves both copies on disk: reads would still be correct,
+            # since path_for is checked first, but the stale text stays behind
+            # for anything that rebuilds the old filename itself.
+            legacy = self.cache_dir / legacy_cache_filename(doi)
+            if legacy != self.path_for(doi):
+                legacy.unlink(missing_ok=True)
             return True
         except OSError:
             return False
