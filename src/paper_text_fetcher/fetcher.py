@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -155,8 +156,15 @@ class PaperFetcher:
         self.session.headers.update({'User-Agent': agent})
 
         self._last_request_at: dict[str, float] = {}
-        self._playwright = None
-        self._browser = None
+        # Playwright's synchronous handles belong to the thread that created
+        # them, so browser state is per-thread rather than per-fetcher. Sharing
+        # one fetcher across a thread pool and driving a single browser from all
+        # of them deadlocks: the workers block in waitpid on a driver that is
+        # waiting for its own thread, and the process spins at full CPU with no
+        # progress. The lock additionally keeps launches serialized, since
+        # starting several Chromium instances at once is where that stall began.
+        self._tls = threading.local()
+        self._browser_lock = threading.Lock()
 
     @property
     def use_cache(self) -> bool:
@@ -213,32 +221,36 @@ class PaperFetcher:
         """
         if not PLAYWRIGHT_AVAILABLE:
             return None
-        if self._browser is None:
-            try:
-                self._playwright = sync_playwright().start()
-                self._browser = self._playwright.chromium.launch(
-                    headless=True,
-                    args=['--disable-blink-features=AutomationControlled']
-                )
-            except Exception as e:
-                self.log(f"Failed to launch browser: {e}")
-                self._close_browser()
-                return None
-        return self._browser
+        if getattr(self._tls, 'browser', None) is None:
+            with self._browser_lock:
+                try:
+                    self._tls.playwright = sync_playwright().start()
+                    self._tls.browser = self._tls.playwright.chromium.launch(
+                        headless=True,
+                        args=['--disable-blink-features=AutomationControlled']
+                    )
+                except Exception as e:
+                    self.log(f"Failed to launch browser: {e}")
+                    self._close_browser()
+                    return None
+        return self._tls.browser
 
     def _close_browser(self):
-        if self._browser is not None:
+        """Release this thread's browser. Other threads keep their own."""
+        browser = getattr(self._tls, 'browser', None)
+        if browser is not None:
             try:
-                self._browser.close()
+                browser.close()
             except Exception:
                 pass
-            self._browser = None
-        if self._playwright is not None:
+            self._tls.browser = None
+        playwright = getattr(self._tls, 'playwright', None)
+        if playwright is not None:
             try:
-                self._playwright.stop()
+                playwright.stop()
             except Exception:
                 pass
-            self._playwright = None
+            self._tls.playwright = None
 
     def close(self):
         """Release the shared browser and the HTTP session."""
