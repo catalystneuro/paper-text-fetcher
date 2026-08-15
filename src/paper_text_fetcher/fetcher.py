@@ -106,6 +106,88 @@ def format_crossref_reference(index: int, ref: dict) -> str:
     return f"[{index}] {body}".rstrip()
 
 
+# Manuscripts under review carry line numbers in the margin. PDF extraction
+# drops them inline, so a sentence comes out as "...and record 356 357 fig 1a
+# the keys were equipped...". Anything reading the text then has to cope with
+# integers appearing mid-sentence, and a quote taken from the paper will not
+# match the extracted text.
+#
+# They are identifiable by position rather than by content: a line number is a
+# bare integer sitting in the margin, in a narrow vertical band, repeated many
+# times down the page. A number inside a sentence fails all three tests.
+LINE_NUMBER_MIN_PER_PAGE = 5      # fewer than this is not a numbered margin
+LINE_NUMBER_BAND_FRACTION = 0.10  # margin is the outer tenth of the page width
+
+
+def _is_bare_integer(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.isdigit() and len(stripped) <= 4
+
+
+def _line_number_span_keys(data: dict, page_rect) -> set:
+    """
+    Identify margin line numbers in a parsed page, keyed by position in the tree.
+
+    Keys are (block, line, span) indices rather than object identity: the parse
+    has to be shared with whoever rebuilds the text, because `get_text('dict')`
+    returns fresh objects on every call and identity does not survive a second
+    parse.
+
+    Returns an empty set unless the page really looks line-numbered, so a paper
+    that merely mentions numbers keeps every one of them.
+    """
+    width = page_rect.width or 1
+    left_edge = page_rect.x0 + width * LINE_NUMBER_BAND_FRACTION
+    right_edge = page_rect.x1 - width * LINE_NUMBER_BAND_FRACTION
+
+    candidates = []   # (key, x0)
+    for bi, block in enumerate(data.get('blocks', [])):
+        if block.get('type') != 0:
+            continue
+        for li, line in enumerate(block.get('lines', [])):
+            for si, span in enumerate(line.get('spans', [])):
+                if not _is_bare_integer(span.get('text', '')):
+                    continue
+                x0, _, x1, _ = span.get('bbox', (0, 0, 0, 0))
+                if x1 <= left_edge or x0 >= right_edge:
+                    candidates.append(((bi, li, si), x0))
+
+    if len(candidates) < LINE_NUMBER_MIN_PER_PAGE:
+        return set()
+
+    # Require a shared vertical band. A numbered margin is a column; a stray
+    # marginal digit such as a figure label or page number is not.
+    banded = {key for key, x0 in candidates
+              if sum(1 for _, other in candidates if abs(other - x0) <= 12)
+              >= LINE_NUMBER_MIN_PER_PAGE}
+    return banded if len(banded) >= LINE_NUMBER_MIN_PER_PAGE else set()
+
+
+def _page_text_without_line_numbers(page) -> str:
+    """Extract a page's text, dropping any margin line numbers it carries."""
+    try:
+        data = page.get_text('dict')
+    except Exception:
+        return page.get_text()
+
+    drop = _line_number_span_keys(data, page.rect)
+    if not drop:
+        return page.get_text()
+
+    out = []
+    for bi, block in enumerate(data.get('blocks', [])):
+        if block.get('type') != 0:
+            continue
+        for li, line in enumerate(block.get('lines', [])):
+            parts = [span.get('text', '')
+                     for si, span in enumerate(line.get('spans', []))
+                     if (bi, li, si) not in drop]
+            text = ''.join(parts).strip()
+            if text:
+                out.append(text)
+    return '\n'.join(out)
+
+
 class PaperFetcher:
     """Fetch full text of scientific papers from multiple sources."""
 
@@ -777,7 +859,8 @@ class PaperFetcher:
                     return None
                 pdf_bytes = resp.content
             with fitz.open(stream=pdf_bytes, filetype='pdf') as doc:
-                text = '\n'.join(page.get_text() for page in doc).strip()
+                text = '\n'.join(
+                    _page_text_without_line_numbers(page) for page in doc).strip()
             if len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
                 return text
             self.log(
