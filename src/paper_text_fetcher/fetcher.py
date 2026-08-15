@@ -115,13 +115,19 @@ def format_crossref_reference(index: int, ref: dict) -> str:
 # They are identifiable by position rather than by content: a line number is a
 # bare integer sitting in the margin, in a narrow vertical band, repeated many
 # times down the page. A number inside a sentence fails all three tests.
-LINE_NUMBER_MIN_PER_PAGE = 5      # fewer than this is not a numbered margin
-LINE_NUMBER_BAND_FRACTION = 0.10  # margin is the outer tenth of the page width
+LINE_NUMBER_MIN_PER_PAGE = 5   # fewer than this is not a numbered margin
+LINE_NUMBER_BAND_TOLERANCE = 12  # points of horizontal jitter within one column
+LINE_NUMBER_TEXT_GAP = 4       # points a line number must clear the text column by
 
 
 def _is_bare_integer(text: str) -> bool:
     stripped = text.strip()
     return stripped.isdigit() and len(stripped) <= 4
+
+
+def _percentile(values: list, fraction: float) -> float:
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(len(ordered) * fraction))]
 
 
 def _line_number_span_keys(data: dict, page_rect) -> set:
@@ -133,32 +139,46 @@ def _line_number_span_keys(data: dict, page_rect) -> set:
     returns fresh objects on every call and identity does not survive a second
     parse.
 
+    The margin is measured from the page rather than assumed. An earlier version
+    treated the outer tenth of the width as margin and missed a preprint whose
+    numbers sat at 10 to 12 percent, so the boundary now comes from where the
+    prose actually begins: on that paper, body text started at x=89 and the line
+    numbers at x=53, a gap no fixed fraction would have to guess at.
+
     Returns an empty set unless the page really looks line-numbered, so a paper
     that merely mentions numbers keeps every one of them.
     """
-    width = page_rect.width or 1
-    left_edge = page_rect.x0 + width * LINE_NUMBER_BAND_FRACTION
-    right_edge = page_rect.x1 - width * LINE_NUMBER_BAND_FRACTION
-
-    candidates = []   # (key, x0)
+    prose_left, prose_right, candidates = [], [], []
     for bi, block in enumerate(data.get('blocks', [])):
         if block.get('type') != 0:
             continue
         for li, line in enumerate(block.get('lines', [])):
             for si, span in enumerate(line.get('spans', [])):
-                if not _is_bare_integer(span.get('text', '')):
-                    continue
                 x0, _, x1, _ = span.get('bbox', (0, 0, 0, 0))
-                if x1 <= left_edge or x0 >= right_edge:
-                    candidates.append(((bi, li, si), x0))
+                if _is_bare_integer(span.get('text', '')):
+                    candidates.append(((bi, li, si), x0, x1))
+                elif (span.get('text') or '').strip():
+                    prose_left.append(x0)
+                    prose_right.append(x1)
 
-    if len(candidates) < LINE_NUMBER_MIN_PER_PAGE:
+    if len(candidates) < LINE_NUMBER_MIN_PER_PAGE or not prose_left:
+        return set()
+
+    # Robust edges of the text column: a low percentile of where prose starts and
+    # a high one of where it ends, so an indented line does not move them.
+    text_left = _percentile(prose_left, 0.10) - LINE_NUMBER_TEXT_GAP
+    text_right = _percentile(prose_right, 0.90) + LINE_NUMBER_TEXT_GAP
+
+    marginal = [(key, x0) for key, x0, x1 in candidates
+                if x1 <= text_left or x0 >= text_right]
+    if len(marginal) < LINE_NUMBER_MIN_PER_PAGE:
         return set()
 
     # Require a shared vertical band. A numbered margin is a column; a stray
     # marginal digit such as a figure label or page number is not.
-    banded = {key for key, x0 in candidates
-              if sum(1 for _, other in candidates if abs(other - x0) <= 12)
+    banded = {key for key, x0 in marginal
+              if sum(1 for _, other in marginal
+                     if abs(other - x0) <= LINE_NUMBER_BAND_TOLERANCE)
               >= LINE_NUMBER_MIN_PER_PAGE}
     return banded if len(banded) >= LINE_NUMBER_MIN_PER_PAGE else set()
 
