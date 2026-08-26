@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from .validation import is_full_text
+from .validation import VALIDATION_VERSION, is_full_text
 
 
 def cache_filename(doi: str) -> str:
@@ -38,15 +38,17 @@ class TextCache:
     """
     JSON-per-DOI cache of paper text.
 
-    Entries record whether the stored text is an article body. Entries written
-    before that flag existed are re-judged from their content on read rather
-    than trusted by source name, because the publisher-HTML and PDF paths
-    previously stored landing pages and abstracts as though they were bodies.
+    Entries record whether the stored text is a structurally verified article
+    body, along with the validation rules version they were written under.
+    Entries from an older version were judged by rules since found unreliable,
+    and their flat text cannot be re-verified structurally, so a full-text
+    claim in one is demoted to status 'unknown' on read.
 
-    Entries that do not hold an article body expire after `metadata_ttl_days`,
-    so a paper that was closed access when first fetched is retried once the
-    entry ages out (papers do become open access later). Full-text entries
-    never expire. Pass `metadata_ttl_days=None` to disable expiry.
+    Entries that do not hold a verified article body — metadata-only and
+    unknown alike — expire after `metadata_ttl_days`, so such a paper is
+    refetched once the entry ages out (papers do become open access later,
+    and demoted entries get re-verified). Verified full-text entries never
+    expire. Pass `metadata_ttl_days=None` to disable expiry.
     """
 
     def __init__(
@@ -74,7 +76,7 @@ class TextCache:
             return legacy
         return None
 
-    def _metadata_entry_is_expired(self, data: dict) -> bool:
+    def _unverified_entry_is_expired(self, data: dict) -> bool:
         if self.metadata_ttl_days is None:
             return False
         cached_at = data.get('cached_at')
@@ -91,13 +93,13 @@ class TextCache:
         age = datetime.now(timezone.utc) - written
         return age.total_seconds() > self.metadata_ttl_days * 86400
 
-    def get(self, doi: str) -> Optional[tuple[str, str, bool]]:
+    def get(self, doi: str) -> Optional[tuple[str, str, bool, str]]:
         """
-        Return (text, source, has_full_text) for a cached DOI, or None.
+        Return (text, source, has_full_text, status) for a cached DOI, or None.
 
         Returns None both when there is no entry and when the entry is
-        unreadable, so a corrupt file simply causes a refetch. Metadata-only
-        entries past their TTL are also treated as misses.
+        unreadable, so a corrupt file simply causes a refetch. Entries without
+        a verified body past their TTL are also treated as misses.
         """
         if not self.enabled:
             return None
@@ -115,18 +117,41 @@ class TextCache:
         source = data.get('source', '')
         text = data.get('text')
         has_full_text = data.get('has_full_text')
-        if has_full_text is None:
-            has_full_text = is_full_text(text, source)
+        status = data.get('status')
 
-        if not has_full_text and self._metadata_entry_is_expired(data):
+        if data.get('validation_version') != VALIDATION_VERSION:
+            # The entry predates structural verification, and its flat text
+            # cannot be verified after the fact: a full-text claim is demoted
+            # to 'unknown'. Either way the entry is now subject to the TTL,
+            # so the paper is refetched and re-verified.
+            claims_full_text = (
+                has_full_text if has_full_text is not None
+                else is_full_text(text, source)
+            )
+            has_full_text = False
+            status = 'unknown' if claims_full_text else 'metadata_only'
+        elif status is None:
+            status = 'full_text' if has_full_text else 'metadata_only'
+
+        if not has_full_text and self._unverified_entry_is_expired(data):
             return None
 
-        return text, source, bool(has_full_text)
+        return text, source, bool(has_full_text), status
 
-    def put(self, doi: str, text: str, source: str, has_full_text: bool) -> bool:
+    def put(
+        self,
+        doi: str,
+        text: str,
+        source: str,
+        has_full_text: bool,
+        status: str | None = None,
+    ) -> bool:
         """Store text for a DOI. Returns whether the write succeeded."""
         if not self.enabled:
             return False
+
+        if status is None:
+            status = 'full_text' if has_full_text else 'metadata_only'
 
         # Write to a temp file and rename so an interrupted write cannot leave
         # a truncated entry, and concurrent writers cannot interleave.
@@ -141,6 +166,8 @@ class TextCache:
                         'text': text,
                         'source': source,
                         'has_full_text': has_full_text,
+                        'status': status,
+                        'validation_version': VALIDATION_VERSION,
                         'cached_at': datetime.now(timezone.utc).isoformat(),
                     }, f)
                 os.replace(tmp_path, self.path_for(doi))

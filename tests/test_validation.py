@@ -7,12 +7,14 @@ network.
 """
 
 import pytest
+from bs4 import BeautifulSoup
 
 from paper_text_fetcher import (
     MIN_FULL_TEXT_CHARS,
     has_full_text_source,
     is_full_text,
     looks_like_paywall_or_landing_page,
+    xml_has_body,
 )
 
 
@@ -64,10 +66,6 @@ class TestLooksLikePaywallOrLandingPage:
         text = marker + ' ' + make_body()
         assert looks_like_paywall_or_landing_page(text) is True
 
-    def test_abstract_without_body_sections_is_rejected(self):
-        abstract = 'Abstract. ' + ('We report a finding of interest. ' * 400)
-        assert looks_like_paywall_or_landing_page(abstract) is True
-
     def test_noscript_javascript_banner_does_not_reject_a_body(self):
         # React-based publisher sites put this banner in a <noscript> tag at
         # the top of genuine full-text pages. It must not read as a bot check.
@@ -100,3 +98,25 @@ class TestIsFullText:
         just_over = make_body(MIN_FULL_TEXT_CHARS)
         assert is_full_text(just_under, 'europe_pmc') is False
         assert is_full_text(just_over, 'europe_pmc') is True
+
+
+class TestXmlHasBody:
+    def test_record_with_substantive_body(self):
+        paragraph = 'We recorded from neurons and analysed the spiking. ' * 20
+        xml = (
+            '<article><front><abstract>Short.</abstract></front>'
+            f'<body><p>{paragraph}</p></body></article>'
+        )
+        assert xml_has_body(BeautifulSoup(xml, 'lxml-xml')) is True
+
+    def test_abstract_only_record_has_no_body(self):
+        xml = (
+            '<article><front><article-title>Title</article-title>'
+            '<abstract>An abstract, however detailed, is not a body.</abstract>'
+            '</front></article>'
+        )
+        assert xml_has_body(BeautifulSoup(xml, 'lxml-xml')) is False
+
+    def test_stub_body_is_rejected(self):
+        xml = '<article><body><p>Too short to be an article body.</p></body></article>'
+        assert xml_has_body(BeautifulSoup(xml, 'lxml-xml')) is False

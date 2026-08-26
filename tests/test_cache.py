@@ -1,12 +1,18 @@
 """
-Tests for the on-disk cache, including how it treats entries written before the
-full-text flag existed and entries written under the legacy filename scheme.
+Tests for the on-disk cache, including how it treats entries written before
+structural verification existed and entries written under the legacy filename
+scheme.
 """
 
 import json
 from datetime import datetime, timedelta, timezone
 
-from paper_text_fetcher import TextCache, cache_filename, legacy_cache_filename
+from paper_text_fetcher import (
+    VALIDATION_VERSION,
+    TextCache,
+    cache_filename,
+    legacy_cache_filename,
+)
 
 
 BODY_TEXT = (
@@ -32,7 +38,15 @@ class TestCacheFilename:
 def test_roundtrip(tmp_path):
     cache = TextCache(tmp_path)
     assert cache.put('10.1/x', 'body text', 'europe_pmc', True) is True
-    assert cache.get('10.1/x') == ('body text', 'europe_pmc', True)
+    assert cache.get('10.1/x') == ('body text', 'europe_pmc', True, 'full_text')
+
+
+def test_status_roundtrip(tmp_path):
+    cache = TextCache(tmp_path)
+    cache.put('10.1/x', 'unverified text', 'publisher_html', False, status='unknown')
+    assert cache.get('10.1/x') == (
+        'unverified text', 'publisher_html', False, 'unknown'
+    )
 
 
 def test_missing_entry_returns_none(tmp_path):
@@ -61,38 +75,8 @@ def test_entry_under_legacy_filename_is_found(tmp_path):
         'has_full_text': True,
         'cached_at': datetime.now(timezone.utc).isoformat(),
     }))
-    assert cache.get('10.1038/nn.4497') == (BODY_TEXT, 'europe_pmc', True)
-
-
-def test_legacy_entry_with_body_is_rejudged_from_content(tmp_path):
-    """
-    An entry with no has_full_text flag whose text reads like a body is
-    rejudged as full text and served.
-    """
-    cache = TextCache(tmp_path)
-    cache.path_for('10.1/legacy').write_text(json.dumps({
-        'doi': '10.1/legacy',
-        'text': BODY_TEXT,
-        'source': 'publisher_html',
-        # no has_full_text key, as written by older versions
-    }))
-    text, source, has_full_text = cache.get('10.1/legacy')
-    assert has_full_text is True
-
-
-def test_legacy_landing_page_entry_is_a_miss(tmp_path):
-    """
-    A legacy entry claiming publisher_html but holding a landing page must not
-    be served as full text. It is rejudged as metadata-only and, since its age
-    is unknown, treated as expired so the paper is refetched.
-    """
-    cache = TextCache(tmp_path)
-    cache.path_for('10.1/legacy').write_text(json.dumps({
-        'doi': '10.1/legacy',
-        'text': 'Access through your institution. Abstract only.',
-        'source': 'crossref+publisher_html',
-    }))
-    assert cache.get('10.1/legacy') is None
+    # Found under the legacy name; its pre-version full-text claim is demoted
+    assert cache.get('10.1038/nn.4497') == (BODY_TEXT, 'europe_pmc', False, 'unknown')
 
 
 def test_writing_retires_the_legacy_entry(tmp_path):
@@ -122,11 +106,88 @@ def test_stored_flag_is_trusted_when_present(tmp_path):
     assert cache.get('10.1/x')[2] is False
 
 
+class TestValidationVersion:
+    def test_put_stamps_the_current_version_and_status(self, tmp_path):
+        cache = TextCache(tmp_path)
+        cache.put('10.1/x', BODY_TEXT, 'europe_pmc', True)
+        data = json.loads(cache.path_for('10.1/x').read_text())
+        assert data['validation_version'] == VALIDATION_VERSION
+        assert data['status'] == 'full_text'
+
+    def test_older_version_full_text_claim_is_demoted_to_unknown(self, tmp_path):
+        """
+        A pre-version entry was judged by keyword heuristics that let front
+        matter and landing pages through, and its flat text cannot be verified
+        structurally after the fact. Its full-text claim must not be trusted.
+        """
+        cache = TextCache(tmp_path)
+        cache.path_for('10.1/old').write_text(json.dumps({
+            'doi': '10.1/old',
+            'text': BODY_TEXT,
+            'source': 'ncbi_pmc+crossref',
+            'has_full_text': True,
+            'cached_at': datetime.now(timezone.utc).isoformat(),
+        }))
+        assert cache.get('10.1/old') == (BODY_TEXT, 'ncbi_pmc+crossref', False, 'unknown')
+
+    def test_demoted_entry_expires_like_metadata(self, tmp_path):
+        cache = TextCache(tmp_path, metadata_ttl_days=7.0)
+        stale = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        cache.path_for('10.1/old').write_text(json.dumps({
+            'doi': '10.1/old',
+            'text': BODY_TEXT,
+            'source': 'ncbi_pmc+crossref',
+            'has_full_text': True,
+            'cached_at': stale,
+        }))
+        assert cache.get('10.1/old') is None
+
+    def test_flagless_legacy_entry_with_body_like_text_is_demoted(self, tmp_path):
+        cache = TextCache(tmp_path)
+        cache.path_for('10.1/legacy').write_text(json.dumps({
+            'doi': '10.1/legacy',
+            'text': BODY_TEXT,
+            'source': 'publisher_html',
+            # no has_full_text key, as written by the oldest versions
+            'cached_at': datetime.now(timezone.utc).isoformat(),
+        }))
+        assert cache.get('10.1/legacy') == (BODY_TEXT, 'publisher_html', False, 'unknown')
+
+    def test_flagless_legacy_metadata_entry_is_a_miss(self, tmp_path):
+        """
+        A legacy entry holding a paywall page is metadata at best and, since
+        its age is unknown, treated as expired so the paper is refetched.
+        """
+        cache = TextCache(tmp_path)
+        cache.path_for('10.1/legacy').write_text(json.dumps({
+            'doi': '10.1/legacy',
+            'text': 'Access through your institution. Abstract only.',
+            'source': 'crossref+publisher_html',
+        }))
+        assert cache.get('10.1/legacy') is None
+
+    def test_current_version_entry_is_trusted(self, tmp_path):
+        cache = TextCache(tmp_path)
+        old = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
+        cache.path_for('10.1/full').write_text(json.dumps({
+            'doi': '10.1/full',
+            'text': BODY_TEXT,
+            'source': 'europe_pmc',
+            'has_full_text': True,
+            'status': 'full_text',
+            'validation_version': VALIDATION_VERSION,
+            'cached_at': old,
+        }))
+        assert cache.get('10.1/full') == (BODY_TEXT, 'europe_pmc', True, 'full_text')
+
+
 class TestMetadataTtl:
     def test_fresh_metadata_entry_is_served(self, tmp_path):
         cache = TextCache(tmp_path, metadata_ttl_days=7.0)
         cache.put('10.1/meta', 'title and refs', 'crossref', False)
-        assert cache.get('10.1/meta') == ('title and refs', 'crossref', False)
+        assert cache.get('10.1/meta') == (
+            'title and refs', 'crossref', False, 'metadata_only'
+        )
 
     def test_expired_metadata_entry_is_a_miss(self, tmp_path):
         cache = TextCache(tmp_path, metadata_ttl_days=7.0)
@@ -136,9 +197,25 @@ class TestMetadataTtl:
             'text': 'title and refs',
             'source': 'crossref',
             'has_full_text': False,
+            'status': 'metadata_only',
+            'validation_version': VALIDATION_VERSION,
             'cached_at': stale,
         }))
         assert cache.get('10.1/meta') is None
+
+    def test_expired_unknown_entry_is_a_miss(self, tmp_path):
+        cache = TextCache(tmp_path, metadata_ttl_days=7.0)
+        stale = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        cache.path_for('10.1/maybe').write_text(json.dumps({
+            'doi': '10.1/maybe',
+            'text': BODY_TEXT,
+            'source': 'publisher_html',
+            'has_full_text': False,
+            'status': 'unknown',
+            'validation_version': VALIDATION_VERSION,
+            'cached_at': stale,
+        }))
+        assert cache.get('10.1/maybe') is None
 
     def test_full_text_entries_never_expire(self, tmp_path):
         cache = TextCache(tmp_path, metadata_ttl_days=7.0)
@@ -148,9 +225,11 @@ class TestMetadataTtl:
             'text': BODY_TEXT,
             'source': 'europe_pmc',
             'has_full_text': True,
+            'status': 'full_text',
+            'validation_version': VALIDATION_VERSION,
             'cached_at': old,
         }))
-        assert cache.get('10.1/full') == (BODY_TEXT, 'europe_pmc', True)
+        assert cache.get('10.1/full') == (BODY_TEXT, 'europe_pmc', True, 'full_text')
 
     def test_none_ttl_disables_expiry(self, tmp_path):
         cache = TextCache(tmp_path, metadata_ttl_days=None)
@@ -160,6 +239,10 @@ class TestMetadataTtl:
             'text': 'title and refs',
             'source': 'crossref',
             'has_full_text': False,
+            'status': 'metadata_only',
+            'validation_version': VALIDATION_VERSION,
             'cached_at': stale,
         }))
-        assert cache.get('10.1/meta') == ('title and refs', 'crossref', False)
+        assert cache.get('10.1/meta') == (
+            'title and refs', 'crossref', False, 'metadata_only'
+        )

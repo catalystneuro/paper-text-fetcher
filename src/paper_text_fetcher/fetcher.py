@@ -21,8 +21,10 @@ from bs4 import BeautifulSoup
 
 from .cache import TextCache
 from .validation import (
+    BODY_EVIDENCE_CONFIRMED,
+    BODY_EVIDENCE_UNVERIFIED,
     MIN_FULL_TEXT_CHARS,
-    has_full_text_source,
+    MIN_STRUCTURAL_BODY_CHARS,
     is_full_text,
     looks_like_paywall_or_landing_page,
     xml_has_body,
@@ -104,6 +106,124 @@ def format_crossref_reference(index: int, ref: dict) -> str:
 
     body = ' '.join(parts) if parts else ''
     return f"[{index}] {body}".rstrip()
+
+
+# The PMC website renders each article from the same JATS record the API
+# serves, and puts the rendered <body> in a dedicated container. Its presence
+# is the same structural body evidence xml_has_body reads from the XML.
+PMC_ARTICLE_BODY_SELECTOR = 'section.main-article-body'
+
+# Publisher-page selectors that specifically mark the article body. Text found
+# under one of these carries structural body evidence.
+PUBLISHER_BODY_SELECTORS = (
+    '.article-content',
+    '.article__body',
+    '#article-body',
+    '.c-article-body',  # Nature
+    '.article-section',
+)
+
+# Generic containers that hold whatever main content the page has — on a
+# landing page that is just the abstract and some chrome — so text found under
+# them is unverified.
+PUBLISHER_GENERIC_SELECTORS = ('article', '[role="main"]', 'main')
+
+
+def extract_pmc_article_body(html: str | bytes) -> Optional[str]:
+    """
+    Extract the article body text from a rendered PMC page.
+
+    Returns None when the page has no substantive article-body container,
+    which is how PMC renders records it holds only front matter for.
+    """
+    soup = BeautifulSoup(html, 'lxml')
+    body_node = soup.select_one(PMC_ARTICLE_BODY_SELECTOR)
+    if body_node is None:
+        return None
+    text = body_node.get_text(separator=' ', strip=True)
+    if len(text) <= MIN_STRUCTURAL_BODY_CHARS:
+        return None
+    return text
+
+
+def extract_publisher_article(html: str | bytes) -> tuple[Optional[str], str]:
+    """
+    Extract article text and body evidence from a publisher HTML page.
+
+    Returns (text, evidence). Text found under a selector that specifically
+    marks the article body is confirmed; text from a generic container or the
+    whole page is unverified, since landing pages put their abstract in those
+    same containers.
+    """
+    soup = BeautifulSoup(html, 'lxml')
+
+    # noscript must go too: React-based publisher sites put an "enable
+    # JavaScript" banner there that would land at the top of the extracted
+    # text and read as a bot-check page
+    for element in soup(['script', 'style', 'noscript', 'nav', 'header', 'footer']):
+        element.decompose()
+
+    for selector in PUBLISHER_BODY_SELECTORS:
+        node = soup.select_one(selector)
+        if node:
+            return node.get_text(separator=' ', strip=True), BODY_EVIDENCE_CONFIRMED
+
+    for selector in PUBLISHER_GENERIC_SELECTORS:
+        node = soup.select_one(selector)
+        if node:
+            return node.get_text(separator=' ', strip=True), BODY_EVIDENCE_UNVERIFIED
+
+    return soup.get_text(separator=' ', strip=True), BODY_EVIDENCE_UNVERIFIED
+
+
+def resolve_fetch_result(parts: list[tuple[str, str, Optional[str]]]) -> dict:
+    """
+    Combine fetched parts into the dict `get_paper_text_detailed` returns.
+
+    Each part is (text, source, evidence), where evidence is
+    BODY_EVIDENCE_CONFIRMED, BODY_EVIDENCE_UNVERIFIED, or None for metadata
+    parts. The status is decided by the best evidence any part carries, never
+    by source names alone.
+    """
+    if not parts:
+        return {
+            'text': None,
+            'source': '',
+            'from_cache': False,
+            'has_full_text': False,
+            'status': 'unavailable',
+            'reason': 'No source returned any text for this DOI',
+        }
+
+    combined_text = '\n\n'.join(text for text, _, _ in parts)
+    source_str = '+'.join(source for _, source, _ in parts)
+    evidence_values = [evidence for _, _, evidence in parts]
+
+    if BODY_EVIDENCE_CONFIRMED in evidence_values:
+        status = 'full_text'
+        reason = None
+    elif BODY_EVIDENCE_UNVERIFIED in evidence_values:
+        status = 'unknown'
+        reason = (
+            f'Text was retrieved (sources: {source_str}) but nothing '
+            'structural marks it as the article body; it may be a landing '
+            'page or front matter.'
+        )
+    else:
+        status = 'metadata_only'
+        reason = (
+            f'No source provided the article body (got: {source_str}). '
+            'The paper is likely closed access with no OA copy.'
+        )
+
+    return {
+        'text': combined_text,
+        'source': source_str,
+        'from_cache': False,
+        'has_full_text': status == 'full_text',
+        'status': status,
+        'reason': reason,
+    }
 
 
 # Manuscripts under review carry line numbers in the margin. PDF extraction
@@ -638,16 +758,13 @@ class PaperFetcher:
                 self.log(f"Page not found for {pmcid}")
                 return None
 
-            text = page.inner_text('body')
+            text = extract_pmc_article_body(page.content())
 
-            if is_full_text(text, 'pmc_playwright'):
-                self.log(f"Got {len(text)} chars from PMC via Playwright")
+            if text is not None:
+                self.log(f"Got {len(text)} chars from PMC article body via Playwright")
                 return text
 
-            self.log(
-                f"PMC Playwright page is not full text "
-                f"({len(text) if text else 0} chars)"
-            )
+            self.log(f"PMC Playwright page for {pmcid} has no article body")
 
         except Exception as e:
             self.log(f"PMC Playwright error: {e}")
@@ -703,10 +820,10 @@ class PaperFetcher:
                         continue
 
                     article = page.query_selector('article')
-                    if article:
-                        text = article.inner_text()
-                    else:
-                        text = page.inner_text('body')
+                    if article is None:
+                        self.log(f"No article element on {server} page")
+                        continue
+                    text = article.inner_text()
 
                     if is_full_text(text, 'playwright_biorxiv'):
                         self.log(f"Got {len(text)} chars from {server} via Playwright")
@@ -731,18 +848,19 @@ class PaperFetcher:
 
         return None
 
-    def get_text_from_publisher_playwright(self, doi: str) -> Optional[str]:
+    def get_text_from_publisher_playwright(self, doi: str) -> tuple[Optional[str], Optional[str]]:
         """
         Scrape full text from publisher's HTML page using Playwright.
 
         This is a fallback for when regular HTTP requests fail (403 Forbidden, etc).
+        Returns (text, body evidence), or (None, None) if nothing usable rendered.
 
         Requires: pip install playwright && playwright install chromium
         """
         browser = self._get_browser()
         if browser is None:
             self.log("Playwright not available, skipping publisher browser fetch")
-            return None
+            return None, None
 
         self.log(f"Trying publisher HTML via Playwright for DOI: {doi}")
 
@@ -763,13 +881,16 @@ class PaperFetcher:
             title = page.title()
             if 'not found' in title.lower() or '404' in title or 'error' in title.lower():
                 self.log(f"Page not found for {doi}")
-                return None
+                return None, None
 
-            text = page.inner_text('body')
+            text, evidence = extract_publisher_article(page.content())
 
             if text and len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
-                self.log(f"Got {len(text)} chars from publisher via Playwright")
-                return text
+                self.log(
+                    f"Got {len(text)} chars from publisher via Playwright "
+                    f"(body evidence: {evidence})"
+                )
+                return text, evidence
 
             self.log(
                 f"Publisher Playwright page is not full text "
@@ -786,14 +907,15 @@ class PaperFetcher:
                 except Exception:
                     pass
 
-        return None
+        return None, None
 
-    def get_text_from_publisher_html(self, doi: str) -> Optional[str]:
+    def get_text_from_publisher_html(self, doi: str) -> tuple[Optional[str], Optional[str]]:
         """
         Scrape full text from publisher's open access HTML page.
 
         Works with Nature, Springer, Cell, Elsevier, and other open access papers.
         Falls back to Playwright if regular HTTP request fails.
+        Returns (text, body evidence), or (None, None) if nothing usable came back.
         """
         self.log(f"Trying publisher HTML for DOI: {doi}")
 
@@ -812,44 +934,19 @@ class PaperFetcher:
             content_type = resp.headers.get('content-type', '')
             if 'text/html' not in content_type:
                 self.log(f"Not HTML content: {content_type}")
-                return None
+                return None, None
 
-            soup = BeautifulSoup(resp.content, 'lxml')
+            text, evidence = extract_publisher_article(resp.content)
 
-            # noscript must go too: React-based publisher sites put an "enable
-            # JavaScript" banner there that would land at the top of the
-            # extracted text and read as a bot-check page
-            for element in soup(['script', 'style', 'noscript', 'nav', 'header', 'footer']):
-                element.decompose()
-
-            article_content = None
-            selectors = [
-                'article',
-                '[role="main"]',
-                '.article-content',
-                '.article__body',
-                '#article-body',
-                '.c-article-body',  # Nature
-                '.article-section',
-                'main',
-            ]
-
-            for selector in selectors:
-                article_content = soup.select_one(selector)
-                if article_content:
-                    break
-
-            if article_content:
-                text = article_content.get_text(separator=' ', strip=True)
-            else:
-                text = soup.get_text(separator=' ', strip=True)
-
-            if len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
-                self.log(f"Got {len(text)} chars from publisher HTML")
-                return text
+            if text and len(text) >= MIN_FULL_TEXT_CHARS and not looks_like_paywall_or_landing_page(text):
+                self.log(
+                    f"Got {len(text)} chars from publisher HTML "
+                    f"(body evidence: {evidence})"
+                )
+                return text, evidence
             else:
                 self.log(
-                    f"Publisher HTML is not full text ({len(text)} chars, "
+                    f"Publisher HTML is not full text ({len(text) if text else 0} chars, "
                     "paywall/landing page or abstract only)"
                 )
                 self.log("Trying Playwright fallback")
@@ -1008,59 +1105,72 @@ class PaperFetcher:
           text           - combined text, or None if nothing was retrieved
           source         - '+'-joined contributing sources ('' if none)
           from_cache     - whether the result came from the local cache
-          has_full_text  - whether any source delivered the article body
-          status         - 'full_text', 'metadata_only', or 'unavailable'
+          has_full_text  - whether a source delivered structurally verified body
+          status         - 'full_text', 'unknown', 'metadata_only', or 'unavailable'
           reason         - human-readable explanation when not full text
 
-        `status` is the field to branch on. 'metadata_only' means we have the
-        title, abstract, and references but no body: usable for mining the
-        reference list, not for judging data reuse, since reuse is described in
-        Methods and Data Availability sections.
+        `status` is the field to branch on. 'full_text' means some part of the
+        text is structurally verified as the article body (a JATS <body>
+        element, a publisher page's article-body node, an article PDF).
+        'unknown' means substantial text was retrieved but nothing structural
+        vouches for it; it may be a body or a landing page. 'metadata_only'
+        means we have the title, abstract, and references but no body: usable
+        for mining the reference list, not for judging data reuse, since reuse
+        is described in Methods and Data Availability sections.
         """
         # Check cache first
         cached = self.cache.get(doi)
         if cached and cached[0]:
-            cached_text, cached_source, cached_full = cached
+            cached_text, cached_source, cached_full, cached_status = cached
+            if cached_status == 'full_text':
+                reason = None
+            elif cached_status == 'unknown':
+                reason = (
+                    'Cached text has no structural evidence of the article '
+                    'body; it may be a landing page or front matter.'
+                )
+            else:
+                reason = (
+                    'No source provided the article body; cached result is '
+                    'metadata only (title, abstract, references)'
+                )
             return {
                 'text': cached_text,
                 'source': cached_source,
                 'from_cache': True,
                 'has_full_text': cached_full,
-                'status': 'full_text' if cached_full else 'metadata_only',
-                'reason': None if cached_full else (
-                    'No source provided the article body; cached result is '
-                    'metadata only (title, abstract, references)'
-                ),
+                'status': cached_status,
+                'reason': reason,
             }
 
-        text_parts = []
-        sources_used = []
+        parts = []  # (text, source, body evidence)
         pmcid = None  # Track PMCID for potential Playwright fallback
+
+        def body_confirmed() -> bool:
+            return any(
+                evidence == BODY_EVIDENCE_CONFIRMED for _, _, evidence in parts
+            )
 
         # For bioRxiv/medRxiv preprints (10.1101/...), use dedicated method first
         if self.is_preprint_doi(doi):
             self.log(f"Preprint DOI detected, trying bioRxiv/medRxiv Playwright first: {doi}")
             playwright_text = self.get_text_from_biorxiv_playwright(doi)
-            if is_full_text(playwright_text, 'playwright_biorxiv'):
+            if playwright_text:
                 self.log(f"Got text from bioRxiv Playwright ({len(playwright_text)} chars)")
-                text_parts.append(playwright_text)
-                sources_used.append('playwright_biorxiv')
+                parts.append((playwright_text, 'playwright_biorxiv', BODY_EVIDENCE_CONFIRMED))
 
             # Also try CrossRef for references
             crossref_text = self.get_text_from_crossref(doi)
             if crossref_text and len(crossref_text) > 100:
                 self.log(f"Got text from crossref ({len(crossref_text)} chars)")
-                text_parts.append(crossref_text)
-                if 'crossref' not in sources_used:
-                    sources_used.append('crossref')
+                parts.append((crossref_text, 'crossref', None))
 
             # If bioRxiv Playwright failed, try Europe PMC (some preprints are indexed there)
-            if not sources_used or sources_used == ['crossref']:
+            if not body_confirmed():
                 text, europe_pmc_pmcid = self.get_text_from_europe_pmc(doi)
                 if is_full_text(text, 'europe_pmc'):
                     self.log(f"Got text from europe_pmc ({len(text)} chars)")
-                    text_parts.insert(0, text)
-                    sources_used.insert(0, 'europe_pmc')
+                    parts.insert(0, (text, 'europe_pmc', BODY_EVIDENCE_CONFIRMED))
         else:
             # For non-preprint DOIs, try Europe PMC first
             text, europe_pmc_pmcid = self.get_text_from_europe_pmc(doi)
@@ -1068,8 +1178,7 @@ class PaperFetcher:
                 pmcid = europe_pmc_pmcid
             if is_full_text(text, 'europe_pmc'):
                 self.log(f"Got text from europe_pmc ({len(text)} chars)")
-                text_parts.append(text)
-                sources_used.append('europe_pmc')
+                parts.append((text, 'europe_pmc', BODY_EVIDENCE_CONFIRMED))
             else:
                 # Try NCBI PMC
                 text, ncbi_pmcid = self.get_text_from_pmc(doi)
@@ -1077,20 +1186,21 @@ class PaperFetcher:
                     pmcid = ncbi_pmcid
                 if is_full_text(text, 'ncbi_pmc'):
                     self.log(f"Got text from ncbi_pmc ({len(text)} chars)")
-                    text_parts.append(text)
-                    sources_used.append('ncbi_pmc')
+                    parts.append((text, 'ncbi_pmc', BODY_EVIDENCE_CONFIRMED))
 
             # Always try CrossRef for the reference list
             crossref_text = self.get_text_from_crossref(doi)
             if crossref_text and len(crossref_text) > 100:
                 self.log(f"Got text from crossref ({len(crossref_text)} chars)")
-                text_parts.append(crossref_text)
-                if 'crossref' not in sources_used:
-                    sources_used.append('crossref')
+                parts.append((crossref_text, 'crossref', None))
 
             # If PMC text is short, try Playwright for more complete content
             MIN_PMC_TEXT_FOR_COMPLETENESS = 15000
-            pmc_text_length = len(text_parts[0]) if text_parts and sources_used and sources_used[0] in ('europe_pmc', 'ncbi_pmc') else 0
+            pmc_text_length = (
+                len(parts[0][0])
+                if parts and parts[0][1] in ('europe_pmc', 'ncbi_pmc')
+                else 0
+            )
 
             if pmc_text_length > 0 and pmc_text_length < MIN_PMC_TEXT_FOR_COMPLETENESS:
                 if not pmcid:
@@ -1100,75 +1210,56 @@ class PaperFetcher:
                     playwright_text = self.get_text_from_pmc_playwright(pmcid)
                     if playwright_text and len(playwright_text) > pmc_text_length:
                         self.log(f"Got better text from PMC Playwright ({len(playwright_text)} chars vs {pmc_text_length})")
-                        text_parts[0] = playwright_text
-                        sources_used[0] = 'pmc_playwright'
+                        parts[0] = (playwright_text, 'pmc_playwright', BODY_EVIDENCE_CONFIRMED)
 
-            # If we don't have PMC full text, try other sources
-            if not sources_used or sources_used == ['crossref']:
+            # Without a verified body yet, keep trying sources that can
+            # deliver one; unverified text does not stop the chain
+            if not body_confirmed():
                 # Try Elsevier API (for 10.1016/ DOIs)
                 elsevier_text = self.get_text_from_elsevier(doi)
                 if is_full_text(elsevier_text, 'elsevier'):
                     self.log(f"Got text from Elsevier API ({len(elsevier_text)} chars)")
-                    text_parts.append(elsevier_text)
-                    sources_used.append('elsevier')
+                    parts.append((elsevier_text, 'elsevier', BODY_EVIDENCE_UNVERIFIED))
 
-            if not sources_used or sources_used == ['crossref']:
+            if not body_confirmed():
                 # Try Unpaywall for OA PDF
                 unpaywall_text = self.get_text_from_unpaywall(doi)
                 if is_full_text(unpaywall_text, 'unpaywall'):
                     self.log(f"Got text from Unpaywall ({len(unpaywall_text)} chars)")
-                    text_parts.append(unpaywall_text)
-                    sources_used.append('unpaywall')
+                    parts.append((unpaywall_text, 'unpaywall', BODY_EVIDENCE_CONFIRMED))
 
-            if not sources_used or sources_used == ['crossref']:
+            if not body_confirmed():
                 # Try scraping publisher HTML as fallback
-                publisher_text = self.get_text_from_publisher_html(doi)
-                if is_full_text(publisher_text, 'publisher_html'):
+                publisher_text, publisher_evidence = self.get_text_from_publisher_html(doi)
+                if publisher_text:
                     self.log(f"Got text from publisher ({len(publisher_text)} chars)")
-                    text_parts.append(publisher_text)
-                    sources_used.append('publisher_html')
+                    parts.append((publisher_text, 'publisher_html', publisher_evidence))
 
-                # If publisher HTML failed but we have a PMCID, try PMC Playwright
-                if (not sources_used or sources_used == ['crossref']) and pmcid:
+                # If publisher HTML gave no verified body but we have a PMCID,
+                # try PMC Playwright
+                if not body_confirmed() and pmcid:
                     self.log(f"Publisher blocked, trying PMC Playwright for {pmcid}")
                     pmc_playwright_text = self.get_text_from_pmc_playwright(pmcid)
-                    if is_full_text(pmc_playwright_text, 'pmc_playwright'):
+                    if pmc_playwright_text:
                         self.log(f"Got text from PMC Playwright ({len(pmc_playwright_text)} chars)")
-                        text_parts.append(pmc_playwright_text)
-                        sources_used.append('pmc_playwright')
+                        parts.append((pmc_playwright_text, 'pmc_playwright', BODY_EVIDENCE_CONFIRMED))
 
-        if text_parts:
-            combined_text = '\n\n'.join(text_parts)
-            source_str = '+'.join(sources_used)
-            has_full_text = has_full_text_source(source_str)
+        result = resolve_fetch_result(parts)
 
-            # Metadata-only results are cached too; the cache expires them
+        if result['text'] is not None:
+            # Non-full-text results are cached too; the cache expires them
             # after its TTL so the fallback chain is eventually retried
-            self.cache.put(doi, combined_text, source_str, has_full_text)
-
-            if not has_full_text:
+            self.cache.put(
+                doi,
+                result['text'],
+                result['source'],
+                result['has_full_text'],
+                status=result['status'],
+            )
+            if not result['has_full_text']:
                 self.log(
-                    f"No full text available for {doi}; returning metadata only "
-                    f"(sources: {source_str})"
+                    f"No verified full text for {doi}; status is "
+                    f"{result['status']} (sources: {result['source']})"
                 )
 
-            return {
-                'text': combined_text,
-                'source': source_str,
-                'from_cache': False,
-                'has_full_text': has_full_text,
-                'status': 'full_text' if has_full_text else 'metadata_only',
-                'reason': None if has_full_text else (
-                    f'No source provided the article body (got: {source_str}). '
-                    'The paper is likely closed access with no OA copy.'
-                ),
-            }
-
-        return {
-            'text': None,
-            'source': '',
-            'from_cache': False,
-            'has_full_text': False,
-            'status': 'unavailable',
-            'reason': 'No source returned any text for this DOI',
-        }
+        return result

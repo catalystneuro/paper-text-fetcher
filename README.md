@@ -50,18 +50,22 @@ else:
 |-----|---------|
 | `text` | The retrieved text, or `None` if nothing came back |
 | `source` | `'+'`-joined list of contributing sources, such as `'europe_pmc+crossref'` |
-| `status` | `'full_text'`, `'metadata_only'`, or `'unavailable'` |
-| `has_full_text` | Whether any source delivered the article body |
+| `status` | `'full_text'`, `'unknown'`, `'metadata_only'`, or `'unavailable'` |
+| `has_full_text` | Whether a source delivered a structurally verified article body |
 | `reason` | Why the result is not full text, when it is not |
 | `from_cache` | Whether the result came from the local cache |
 
-The three statuses are worth distinguishing. `full_text` means the body was
-retrieved. `metadata_only` means the DOI resolves and we retrieved a title, an
-abstract, and usually a reference list, but no source would give us the body,
-which normally indicates a closed-access article with no open copy. That result
-is still useful for mining the bibliography, and it is returned rather than
-discarded, but it should not be fed to anything that expects a paper.
-`unavailable` means no source returned anything at all.
+The four statuses are worth distinguishing. `full_text` means the body was
+retrieved and structurally verified. `unknown` means substantial text was
+retrieved but nothing structural vouches for it being the body — it may be a
+genuine article from a publisher page the library has no body selector for, or
+it may be a landing page; the caller decides whether to use it, flag it, or
+judge it by other means. `metadata_only` means the DOI resolves and we
+retrieved a title, an abstract, and usually a reference list, but no source
+would give us the body, which normally indicates a closed-access article with
+no open copy. That result is still useful for mining the bibliography, and it
+is returned rather than discarded, but it should not be fed to anything that
+expects a paper. `unavailable` means no source returned anything at all.
 
 `get_paper_text()` remains available and returns a `(text, source, from_cache)`
 tuple for callers that predate the status field. It cannot express the
@@ -95,55 +99,64 @@ often omit.
 
 ## How Full Text Is Detected
 
-Two conditions must both hold. A source capable of delivering a body must claim
-to have done so, and the text itself must read like a body.
+A result is `full_text` only when the document's own structure marks the
+retrieved text as the article body. Guessing from the text itself — length,
+keywords, section-heading heuristics — is what earlier versions did, and it
+passed front matter and landing pages as articles, so no amount of retrieved
+text upgrades a result on its own.
 
-The second condition is necessary because the publisher-HTML and PDF paths
-accept whatever the server returns, and servers routinely return a paywall
-interstitial or an abstract landing page with HTTP 200. Those pages can run to
-several thousand characters of navigation, abstract, and references without
-containing a single sentence of the paper. So text must clear a length floor
-(`MIN_FULL_TEXT_CHARS`, 6000), must not match known paywall and bot-check
-phrases, and must contain at least one section heading that essentially every
-research article has and no abstract does.
+What counts as structural evidence differs per source:
 
-For JATS records from Europe PMC and NCBI there is a more reliable signal, since
-both return a record containing only `<front>` when an article is indexed but not
-open. The presence of a substantive `<body>` element is checked directly.
+| Source | Evidence |
+|--------|----------|
+| Europe PMC, NCBI PMC | A substantive `<body>` element in the JATS record; both return `<front>`-only records for articles that are indexed but not open |
+| PMC via Playwright | The rendered page's article-body container, which PMC renders from the same JATS `<body>` |
+| bioRxiv / medRxiv | The `<article>` element on the `.full` page of the preprint server |
+| Publisher HTML | A selector that specifically marks the article body (Nature's `.c-article-body` and similar) |
+| Unpaywall PDFs | Provenance: the URL is Unpaywall's open-access copy of the article itself, so a valid PDF with substantial text is the article |
+| Elsevier ScienceDirect | None yet; its plain-text response is reported as `unknown` |
 
-These rules are in `validation.py` as pure functions, so they can be tested and
-tuned without touching the network.
+Text that arrives without such evidence — a publisher page where only a generic
+`article` or `main` container matched, or no container at all — is reported as
+`unknown`, never as `full_text`. A landing page puts its abstract in the same
+generic containers a full-text page uses, so their presence proves nothing.
 
-The heuristics are deliberately conservative and will reject some genuine full
-text. An article with no Methods, Results, Discussion, or Acknowledgements
-section will be classified as metadata only, which is the correct outcome for
-most uses but wrong if you specifically want short commentaries and editorials.
-Measured against a corpus of 73,500 cached papers, the rules reject 0.2% of
-Europe PMC results and 0.1% of bioRxiv results, and inspection of a sample of
-those found them to be genuine front-matter-only records rather than false
-positives.
+Sanity gates still apply on top: text must clear a length floor
+(`MIN_FULL_TEXT_CHARS`, 6000, so an abstract-sized fragment is never taken) and
+must not open with known paywall or bot-check phrases.
+
+The rules live in `validation.py` and the DOM extraction helpers in
+`fetcher.py` as pure functions, so they can be tested without touching the
+network.
+
+The design is deliberately conservative: when a publisher's markup is not
+recognized, the result degrades to `unknown` rather than to a false
+`full_text`, so failures are visible instead of silent.
 
 ## Caching
 
-Text is cached as one JSON file per DOI in `cache_dir`. Each entry records
-whether it holds an article body. Filenames are the percent-encoded, lowercased
-DOI, which is reversible and so cannot map two different DOIs onto one file.
-Entries written under the older scheme are still found and read.
+Text is cached as one JSON file per DOI in `cache_dir`. Each entry records its
+status and the version of the validation rules it was written under. Filenames
+are the percent-encoded, lowercased DOI, which is reversible and so cannot map
+two different DOIs onto one file. Entries written under the older scheme are
+still found and read.
 
-Entries written before the full-text flag existed are re-judged from their
-content on read rather than trusted by their source name. This matters when
-adopting the library against an existing cache: the older code stored landing
-pages under the `publisher_html` source, so believing the source name would
-carry the original error forward. Re-judging on read corrects it without a
-refetch.
+Entries written under an older validation version were judged by rules since
+found unreliable, and their flat text cannot be verified structurally after
+the fact. A full-text claim in such an entry is therefore served as `unknown`
+rather than trusted, and the entry becomes subject to the TTL below, so the
+paper is eventually refetched and re-verified. This matters when adopting this
+version against an existing cache: entries that really hold front matter or
+landing pages stop being reported as full text immediately, and each cached
+paper is re-verified at most once.
 
-Metadata-only results are cached as well, but they expire after
-`metadata_cache_ttl_days` (7 by default, `None` to disable). Full-text entries
-never expire. The asymmetry is deliberate: a body does not stop being a body,
-but a paper that was closed access last month may be open today, and without
-expiry it would never be retried. Caching these results at all matters for
-throughput, since a closed-access DOI otherwise re-walks the entire fallback
-chain, browser included, on every lookup.
+Results without a verified body — metadata-only and unknown alike — expire
+after `metadata_cache_ttl_days` (7 by default, `None` to disable). Verified
+full-text entries never expire. The asymmetry is deliberate: a body does not
+stop being a body, but a paper that was closed access last month may be open
+today, and without expiry it would never be retried. Caching these results at
+all matters for throughput, since a closed-access DOI otherwise re-walks the
+entire fallback chain, browser included, on every lookup.
 
 ## Request Pacing
 
@@ -166,6 +179,7 @@ the anonymous ones.
 python -m pytest tests/
 ```
 
-The tests cover the validation rules and the cache, and none of them touch the
-network. There is no test coverage of the individual source fetchers, which
-would need either recorded fixtures or live requests.
+The tests cover the validation rules, the DOM extraction helpers, the
+composite-result resolution, and the cache, and none of them touch the
+network. There is no test coverage of the live source fetchers themselves,
+which would need either recorded fixtures or live requests.
